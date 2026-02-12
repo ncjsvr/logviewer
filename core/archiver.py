@@ -252,7 +252,7 @@ async def archive_attachments_batch(app, session, config):
     db = app.ctx.db
 
     cursor = db.logs.find(
-        {"messages.attachments": {"$exists": True, "$ne": []}},
+        {"messages.attachments.0": {"$exists": True}},
         {"messages.attachments": 1, "key": 1},
     ).batch_size(50)
 
