@@ -251,14 +251,21 @@ async def archive_attachments_batch(app, session, config):
     """Scan logs for unarchived attachment URLs and archive them."""
     db = app.ctx.db
 
+    logger.info("Attachment archiver: scanning for unarchived attachments...")
+
     cursor = db.logs.find(
         {"messages.attachments.0": {"$exists": True}},
         {"messages.attachments": 1, "key": 1},
     ).batch_size(50)
 
     count_archived = 0
+    count_skipped = 0
+    count_failed = 0
+    count_404 = 0
+    logs_scanned = 0
 
     async for doc in cursor:
+        logs_scanned += 1
         for message in doc.get("messages", []):
             for att in message.get("attachments", []):
                 if isinstance(att, str):
@@ -277,23 +284,33 @@ async def archive_attachments_batch(app, session, config):
 
                 existing = await db.archived_attachments.find_one({"original_url": canonical_url})
                 if existing:
+                    count_skipped += 1
                     continue
 
+                logger.info("Attachment archiver: archiving %s from log %s", filename, doc.get("key", "?"))
                 result = await download_and_store(app, session, url, filename, config)
                 await _record_result(db, canonical_url, filename, result)
 
                 if result is not None and result not in ("404", "oversized"):
                     count_archived += 1
+                elif result == "404":
+                    count_404 += 1
+                else:
+                    count_failed += 1
 
                 await asyncio.sleep(0.5)
 
-    if count_archived > 0:
-        logger.info("Attachments archived this cycle: %d", count_archived)
+    logger.info(
+        "Attachment archiver: scan complete - %d logs scanned, %d archived, %d already archived, %d expired (404), %d failed",
+        logs_scanned, count_archived, count_skipped, count_404, count_failed,
+    )
 
 
 async def archive_avatars_batch(app, session, config):
     """Scan logs for unarchived avatar URLs and archive them."""
     db = app.ctx.db
+
+    logger.info("Attachment archiver: scanning for unarchived avatars...")
 
     cursor = db.logs.find(
         {},
@@ -308,8 +325,13 @@ async def archive_avatars_batch(app, session, config):
 
     seen_urls = set()
     count_archived = 0
+    count_skipped = 0
+    count_failed = 0
+    count_404 = 0
+    logs_scanned = 0
 
     async for doc in cursor:
+        logs_scanned += 1
         avatar_urls = []
 
         for field in ("creator", "recipient", "closer"):
@@ -337,19 +359,27 @@ async def archive_avatars_batch(app, session, config):
 
             existing = await db.archived_attachments.find_one({"original_url": canonical_url})
             if existing:
+                count_skipped += 1
                 continue
 
             url_path = canonical_url.rsplit("/", 1)[-1] if "/" in canonical_url else "avatar.png"
+            logger.info("Attachment archiver: archiving avatar %s from log %s", url_path, doc.get("key", "?"))
             result = await download_and_store(app, session, url, url_path, config)
             await _record_result(db, canonical_url, url_path, result)
 
             if result is not None and result not in ("404", "oversized"):
                 count_archived += 1
+            elif result == "404":
+                count_404 += 1
+            else:
+                count_failed += 1
 
             await asyncio.sleep(0.5)
 
-    if count_archived > 0:
-        logger.info("Avatars archived this cycle: %d", count_archived)
+    logger.info(
+        "Attachment archiver: avatar scan complete - %d logs scanned, %d archived, %d already archived, %d expired (404), %d failed",
+        logs_scanned, count_archived, count_skipped, count_404, count_failed,
+    )
 
 
 async def cleanup_expired(app, retention_delta):
@@ -396,16 +426,18 @@ async def run_archiver_loop(app, config):
 
     while True:
         try:
+            logger.info("Attachment archiver: starting scan cycle")
             async with aiohttp.ClientSession(
                 headers={"User-Agent": "ModmailLogviewer/1.0 (attachment archiver)"}
             ) as session:
                 await archive_attachments_batch(app, session, config)
                 await archive_avatars_batch(app, session, config)
             await cleanup_expired(app, retention_delta)
+            logger.info("Attachment archiver: cycle complete, next scan in %ds", interval)
         except asyncio.CancelledError:
-            logger.info("Archiver task cancelled, shutting down")
+            logger.info("Attachment archiver: task cancelled, shutting down")
             return
         except Exception as e:
-            logger.error("Archiver loop error: %s", e, exc_info=True)
+            logger.error("Attachment archiver: loop error: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
